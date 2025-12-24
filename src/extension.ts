@@ -58,6 +58,7 @@ import { copyBufferRevisionCommands } from './commands/copyBufferRevisionCommand
 import { submodules } from './commands/submodulesCommands';
 import { forgeRefreshInterval } from './forge';
 import { bisecting } from './commands/bisectCommands';
+import { clearGitCache } from './utils/commandRunner/command';
 
 export const magitRepositories: Map<string, MagitRepository> = new Map<string, MagitRepository>();
 export const views: Map<string, DocumentView> = new Map<string, DocumentView>();
@@ -102,6 +103,10 @@ export function activate(context: ExtensionContext) {
   workspace.onDidChangeConfiguration(configChangedEvent => {
     if (configChangedEvent.affectsConfiguration('magit')) {
       loadConfig();
+      // Clear cached git path if git-path config changed
+      if (configChangedEvent.affectsConfiguration('magit.git-path')) {
+        clearGitCache();
+      }
     }
   });
 

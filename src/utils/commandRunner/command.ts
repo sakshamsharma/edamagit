@@ -1,11 +1,36 @@
 import * as cp from 'child_process';
 import { CancellationToken, Disposable, Event, Uri } from 'vscode';
 import * as path from 'path';
-import { findGit } from './findGit';
+import { findGit, IGit } from './findGit';
 import * as iconv from '@vscode/iconv-lite-umd';
 import { dispose, IDisposable, toDisposable } from './disposable';
 import { magitConfig } from '../../extension';
 import { GitConfigOverrideArgs } from '../../common/constants';
+
+// Cache the git path to avoid expensive findGit() lookups on every command
+let cachedGit: IGit | undefined;
+let cachedGitPathHints: string[] | undefined;
+
+export function clearGitCache(): void {
+  cachedGit = undefined;
+  cachedGitPathHints = undefined;
+}
+
+async function getCachedGit(pathHints: string[]): Promise<IGit> {
+  // Check if cache is valid (same pathHints)
+  const hintsMatch = cachedGitPathHints &&
+    pathHints.length === cachedGitPathHints.length &&
+    pathHints.every((hint, i) => hint === cachedGitPathHints![i]);
+
+  if (cachedGit && hintsMatch) {
+    return cachedGit;
+  }
+
+  // Cache miss - find git and cache the result
+  cachedGit = await findGit(pathHints, () => true);
+  cachedGitPathHints = [...pathHints];
+  return cachedGit;
+}
 
 const canceledName = 'Canceled';
 class CancellationError extends Error {
@@ -176,10 +201,11 @@ async function _exec(args: string[], options: SpawnOptions = {}): Promise<IExecu
 
   let pathHints = Array.isArray(magitConfig.gitPath) ? magitConfig.gitPath : magitConfig.gitPath ? [magitConfig.gitPath] : [];
   if (pathHints.length !== 0) {
-    pathHints = pathHints.filter(p => path.isAbsolute(p));  
+    pathHints = pathHints.filter(p => path.isAbsolute(p));
   }
 
-  const git = await findGit(pathHints, () => true);
+  // Use cached git path to avoid expensive lookups on every command
+  const git = await getCachedGit(pathHints);
   const child = spawn(git.path, [...GitConfigOverrideArgs, ...args], options);
 
   // options.onSpawn?.(child);

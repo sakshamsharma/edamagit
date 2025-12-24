@@ -69,9 +69,11 @@ export async function internalMagitStatus(repository: Repository): Promise<Magit
 
   const dotGitPath = repository.rootUri + '/.git/';
 
+  // Start all independent async operations in parallel for maximum speed
   const stashTask = getStashes(repository);
-
   const logTask = repository.state.HEAD?.commit ? repository.log({ maxEntries: 100 }) : Promise.resolve([]);
+  const refsTask = getRefs(repository);  // Start refs fetch early
+  const bisectingStatusTask = bisectingStatus(repository);  // Start early
 
   let ahead, behind: Promise<MagitCommitList> | undefined;
 
@@ -90,22 +92,23 @@ export async function internalMagitStatus(repository: Repository): Promise<Magit
   const workingTreeChanges_NoUntracked = repository.state.workingTreeChanges
     .filter(c => (c.status !== Status.UNTRACKED));
 
-  const untrackedFiles: MagitChange[] =
+  // Start untracked files task in parallel instead of awaiting inline
+  const untrackedFilesTask: Promise<MagitChange[]> =
     repository.state.workingTreeChanges.length > workingTreeChanges_NoUntracked.length ?
-      (await gitRun(repository, ['ls-files', '--others', '--exclude-standard', '--directory', '--no-empty-directory'], {}, LogLevel.None, false))
-        .stdout
-        .replace(Constants.FinalLineBreakRegex, '')
-        .split(Constants.LineSplitterRegex)
-        .map(untrackedPath => {
-          const uri = Uri.from({ ...repository.rootUri, path: repository.rootUri.path + '/' + untrackedPath });
-          return {
-            originalUri: uri,
-            renameUri: uri,
-            uri: uri,
-            status: Status.UNTRACKED,
-            relativePath: FilePathUtils.uriPathRelativeTo(uri, repository.rootUri)
-          };
-        }) : [];
+      gitRun(repository, ['ls-files', '--others', '--exclude-standard', '--directory', '--no-empty-directory'], {}, LogLevel.None, false)
+        .then(result => result.stdout
+          .replace(Constants.FinalLineBreakRegex, '')
+          .split(Constants.LineSplitterRegex)
+          .map(untrackedPath => {
+            const uri = Uri.from({ ...repository.rootUri, path: repository.rootUri.path + '/' + untrackedPath });
+            return {
+              originalUri: uri,
+              renameUri: uri,
+              uri: uri,
+              status: Status.UNTRACKED,
+              relativePath: FilePathUtils.uriPathRelativeTo(uri, repository.rootUri)
+            };
+          })) : Promise.resolve([]);
 
   const workingTreeChangesTasks = Promise.all(workingTreeChanges_NoUntracked
     .map(async change => {
@@ -135,12 +138,17 @@ export async function internalMagitStatus(repository: Repository): Promise<Magit
 
   const HEAD = repository.state.HEAD as MagitBranch | undefined;
 
-  const refs = await getRefs(repository);
+  // Await refs only when needed - all parallel tasks are already running
+  const refs = await refsTask;
 
   if (HEAD?.commit) {
-    HEAD.commitDetails = await getCommit(repository, HEAD.commit);
+    // Start HEAD commit details fetch - can run in parallel with other work
+    const headCommitDetailsTask = getCommit(repository, HEAD.commit);
 
     HEAD.tag = refs.find(r => HEAD?.commit === r.commit && r.type === RefType.Tag);
+
+    // Start pushRemote task early so it runs in parallel
+    const pushRemoteTask = pushRemoteStatus(repository, refs);
 
     try {
       if (HEAD.upstream?.remote) {
@@ -148,22 +156,35 @@ export async function internalMagitStatus(repository: Repository): Promise<Magit
 
         const upstreamRemoteCommit = refs.find(ref => ref.remote === upstreamRemote && ref.name === `${upstreamRemote}/${HEAD.upstream?.name}`)?.commit;
         const upstreamRemoteCommitDetails = upstreamRemoteCommit ? getCommit(repository, upstreamRemoteCommit) : undefined;
-
         const isRebaseUpstream = repository.getConfig(`branch.${HEAD.upstream.name}.rebase`);
 
+        // Await all upstream-related promises in parallel
+        const [commitDetails, aheadResult, behindResult, rebaseConfig] = await Promise.all([
+          upstreamRemoteCommitDetails,
+          ahead ?? Promise.resolve(undefined),
+          behind ?? Promise.resolve(undefined),
+          isRebaseUpstream
+        ]);
+
         HEAD.upstreamRemote = HEAD.upstream;
-        HEAD.upstreamRemote.commit = await upstreamRemoteCommitDetails;
-        if (ahead) {
-          HEAD.upstreamRemote.ahead = await ahead;
+        HEAD.upstreamRemote.commit = commitDetails;
+        if (aheadResult) {
+          HEAD.upstreamRemote.ahead = aheadResult;
         }
-        if (behind) {
-          HEAD.upstreamRemote.behind = await behind;
+        if (behindResult) {
+          HEAD.upstreamRemote.behind = behindResult;
         }
-        HEAD.upstreamRemote.rebase = (await isRebaseUpstream) === 'true';
+        HEAD.upstreamRemote.rebase = rebaseConfig === 'true';
       }
     } catch { }
 
-    HEAD.pushRemote = await pushRemoteStatus(repository);
+    // Await remaining HEAD-related tasks
+    const [headCommitDetails, pushRemote] = await Promise.all([
+      headCommitDetailsTask,
+      pushRemoteTask
+    ]);
+    HEAD.commitDetails = headCommitDetails;
+    HEAD.pushRemote = pushRemote;
   }
 
   const remoteBranches = refs.filter(ref => ref.type === RefType.RemoteHead);
@@ -177,21 +198,35 @@ export async function internalMagitStatus(repository: Repository): Promise<Magit
 
   const forgeState = forgeStatusCached(remotes);
 
-  const bisectingStatusTask = bisectingStatus(repository);
+  // Await all remaining parallel tasks at once
+  const [stashes, log, workingTreeChanges, indexChanges, mergeChanges, untrackedFiles,
+         rebasingState, mergingState, cherryPickingState, revertingState, bisectState] = await Promise.all([
+    stashTask,
+    logTask,
+    workingTreeChangesTasks,
+    indexChangesTasks,
+    mergeChangesTasks,
+    untrackedFilesTask,
+    rebasingStateTask,
+    mergingStateTask,
+    cherryPickingStateTask,
+    revertingStateTask,
+    bisectingStatusTask
+  ]);
 
   return {
     uri: repository.rootUri,
     HEAD,
-    stashes: await stashTask,
-    log: await logTask,
-    workingTreeChanges: await workingTreeChangesTasks,
-    indexChanges: await indexChangesTasks,
-    mergeChanges: await mergeChangesTasks,
+    stashes,
+    log,
+    workingTreeChanges,
+    indexChanges,
+    mergeChanges,
     untrackedFiles,
-    rebasingState: await rebasingStateTask,
-    mergingState: await mergingStateTask,
-    cherryPickingState: await cherryPickingStateTask,
-    revertingState: await revertingStateTask,
+    rebasingState,
+    mergingState,
+    cherryPickingState,
+    revertingState,
     branches: refs.filter(ref => ref.type === RefType.Head),
     remotes,
     tags: refs.filter(ref => ref.type === RefType.Tag),
@@ -199,7 +234,7 @@ export async function internalMagitStatus(repository: Repository): Promise<Magit
     submodules: repository.state.submodules,
     gitRepository: repository,
     forgeState: forgeState,
-    bisectState: await bisectingStatusTask
+    bisectState
   };
 }
 
@@ -227,7 +262,7 @@ async function getCommitRange(repository: Repository, from: string, to: string, 
   };
 }
 
-async function pushRemoteStatus(repository: Repository): Promise<MagitUpstreamRef | undefined> {
+async function pushRemoteStatus(repository: Repository, refs: Ref[]): Promise<MagitUpstreamRef | undefined> {
   try {
     const HEAD = repository.state.HEAD;
     const pushRemote = await repository.getConfig(`branch.${HEAD!.name}.pushRemote`);
@@ -237,14 +272,14 @@ async function pushRemoteStatus(repository: Repository): Promise<MagitUpstreamRe
       const ahead = getCommitRange(repository, `${pushRemote}/${HEAD.name}`, HEAD.name, maxCommitsAheadBehind);
       const behind = getCommitRange(repository, HEAD.name, `${pushRemote}/${HEAD.name}`, maxCommitsAheadBehind);
 
-      const refs = await getRefs(repository);
+      // Reuse refs passed from caller instead of fetching again
       const pushRemoteCommit = refs.find(ref => ref.remote === pushRemote && ref.name === `${pushRemote}/${HEAD.name}`)?.commit;
       const pushRemoteCommitDetails = pushRemoteCommit ? getCommit(repository, pushRemoteCommit) : Promise.resolve(undefined);
 
-      return { 
-        remote: pushRemote, 
-        name: HEAD.name, 
-        commit: await pushRemoteCommitDetails, 
+      return {
+        remote: pushRemote,
+        name: HEAD.name,
+        commit: await pushRemoteCommitDetails,
         ahead: await ahead,
         behind: await behind,
       };
@@ -439,7 +474,7 @@ async function getStashes(repository: Repository): Promise<Stash[]> {
 }
 
 async function getRefs(repository: Repository): Promise<Ref[]> {
-  // `repository.getRefs` is not available on older versions and we should 
+  // `repository.getRefs` is not available on older versions and we should
   // just use `repository.state.refs` on those versions.
   if (typeof repository.getRefs !== 'function') {
     return repository.state.refs;
